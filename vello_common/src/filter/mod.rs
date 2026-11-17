@@ -7,6 +7,7 @@
 //! represent a special representation of each filter to be used as the basis for rendering in
 //! `vello_gpu` and `vello_cpu`.
 
+use crate::filter::color_matrix::ColorMatrix;
 use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
 use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
@@ -17,7 +18,9 @@ use crate::kurbo::{Affine, Rect, Vec2};
 use crate::math::snap_up;
 use crate::tile::Tile;
 use crate::util::RectExt;
+use smallvec::SmallVec;
 
+pub mod color_matrix;
 pub mod drop_shadow;
 pub mod flood;
 pub mod gaussian_blur;
@@ -34,17 +37,42 @@ pub enum PreparedFilter {
     Offset(Offset),
     /// A drop shadow filter.
     DropShadow(DropShadow),
+    /// A color matrix filter.
+    ColorMatrix(ColorMatrix),
 }
 
 impl PreparedFilter {
     /// Build a new prepared filter for the given transform.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filter graph contains more than one primitive; use
+    /// [`PreparedFilter::prepare_all`] for multi-primitive graphs.
     pub fn new(filter: &Filter, transform: &Affine) -> Self {
         // Multi-primitive filter graphs are not yet implemented.
         if filter.graph.primitives.len() != 1 {
             unimplemented!("Multi-primitive filter graphs are not yet supported");
         }
 
-        match &filter.graph.primitives[0] {
+        Self::from_primitive(&filter.graph.primitives[0], transform)
+    }
+
+    /// Prepare all primitives of the filter graph in execution order.
+    ///
+    /// The primitives of a graph are applied in insertion order, each taking
+    /// the output of the previous primitive as its input.
+    pub fn prepare_all(filter: &Filter, transform: &Affine) -> SmallVec<[Self; 1]> {
+        filter
+            .graph
+            .primitives
+            .iter()
+            .map(|primitive| Self::from_primitive(primitive, transform))
+            .collect()
+    }
+
+    /// Build a prepared filter for a single primitive.
+    fn from_primitive(primitive: &FilterPrimitive, transform: &Affine) -> Self {
+        match primitive {
             FilterPrimitive::Flood { color } => {
                 let flood = Flood::new(*color);
                 Self::Flood(flood)
@@ -98,8 +126,11 @@ impl PreparedFilter {
 
                 Self::Offset(offset)
             }
+            FilterPrimitive::ColorMatrix { matrix } => {
+                Self::ColorMatrix(ColorMatrix::new(*matrix))
+            }
             _ => {
-                // Other primitives like Blend, ColorMatrix, ComponentTransfer, etc.
+                // Other primitives like Blend, ComponentTransfer, etc.
                 // are not yet implemented
                 unimplemented!("Other filter primitives not yet implemented");
             }

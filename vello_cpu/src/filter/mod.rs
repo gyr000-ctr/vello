@@ -9,6 +9,7 @@
 //! intermediate buffers.
 
 pub(crate) mod context;
+mod color_matrix;
 mod drop_shadow;
 mod flood;
 mod gaussian_blur;
@@ -47,37 +48,38 @@ pub(crate) trait FilterEffect {
 /// Apply the low-precision (u8) version of a filter effect to a layer.
 ///
 /// This function dispatches filter primitives from a filter graph to their
-/// corresponding CPU implementations using 8-bit color channels.
+/// corresponding CPU implementations using 8-bit color channels. The
+/// primitives are applied in insertion order, each operating on the output of
+/// the previous one.
 ///
 /// # Arguments
 /// * `filter` - The filter containing the graph of primitives to apply
 /// * `pixmap` - The target pixmap containing rendering metadata
 /// * `filter_scratch` - Reusable scratch storage for intermediate buffers
 /// * `transform` - The transformation matrix to extract scale from for filter parameters
-///
-/// # Limitations
-/// Currently only supports filter graphs with a single primitive.
-/// Multi-primitive filter graphs are not yet implemented.
 pub(crate) fn filter_lowp(
     filter: &Filter,
     pixmap: &mut Pixmap,
     filter_scratch: &mut ScratchBuffer,
     transform: Affine,
 ) {
-    let prepared_filter = PreparedFilter::new(filter, &transform);
-
-    match prepared_filter {
-        PreparedFilter::Flood(flood) => {
-            flood.execute_lowp(pixmap, filter_scratch);
-        }
-        PreparedFilter::GaussianBlur(blur) => {
-            blur.execute_lowp(pixmap, filter_scratch);
-        }
-        PreparedFilter::Offset(offset) => {
-            offset.execute_lowp(pixmap, filter_scratch);
-        }
-        PreparedFilter::DropShadow(drop_shadow) => {
-            drop_shadow.execute_lowp(pixmap, filter_scratch);
+    for prepared_filter in PreparedFilter::prepare_all(filter, &transform) {
+        match prepared_filter {
+            PreparedFilter::Flood(flood) => {
+                flood.execute_lowp(pixmap, filter_scratch);
+            }
+            PreparedFilter::GaussianBlur(blur) => {
+                blur.execute_lowp(pixmap, filter_scratch);
+            }
+            PreparedFilter::Offset(offset) => {
+                offset.execute_lowp(pixmap, filter_scratch);
+            }
+            PreparedFilter::DropShadow(drop_shadow) => {
+                drop_shadow.execute_lowp(pixmap, filter_scratch);
+            }
+            PreparedFilter::ColorMatrix(color_matrix) => {
+                color_matrix.execute_lowp(pixmap, filter_scratch);
+            }
         }
     }
 }
@@ -86,36 +88,37 @@ pub(crate) fn filter_lowp(
 ///
 /// This function dispatches filter primitives from a filter graph to their
 /// corresponding CPU implementations using 32-bit floating-point color channels.
+/// The primitives are applied in insertion order, each operating on the output
+/// of the previous one.
 ///
 /// # Arguments
 /// * `filter` - The filter containing the graph of primitives to apply
 /// * `pixmap` - The target pixmap containing rendering metadata
 /// * `filter_scratch` - Reusable scratch storage for intermediate buffers
 /// * `transform` - The transformation matrix to extract scale from for filter parameters
-///
-/// # Limitations
-/// Currently only supports filter graphs with a single primitive.
-/// Multi-primitive filter graphs are not yet implemented.
 pub(crate) fn filter_highp(
     filter: &Filter,
     pixmap: &mut Pixmap,
     filter_scratch: &mut ScratchBuffer,
     transform: Affine,
 ) {
-    let prepared_filter = PreparedFilter::new(filter, &transform);
-
-    match prepared_filter {
-        PreparedFilter::Flood(flood) => {
-            flood.execute_highp(pixmap, filter_scratch);
-        }
-        PreparedFilter::GaussianBlur(blur) => {
-            blur.execute_highp(pixmap, filter_scratch);
-        }
-        PreparedFilter::Offset(offset) => {
-            offset.execute_highp(pixmap, filter_scratch);
-        }
-        PreparedFilter::DropShadow(drop_shadow) => {
-            drop_shadow.execute_highp(pixmap, filter_scratch);
+    for prepared_filter in PreparedFilter::prepare_all(filter, &transform) {
+        match prepared_filter {
+            PreparedFilter::Flood(flood) => {
+                flood.execute_highp(pixmap, filter_scratch);
+            }
+            PreparedFilter::GaussianBlur(blur) => {
+                blur.execute_highp(pixmap, filter_scratch);
+            }
+            PreparedFilter::Offset(offset) => {
+                offset.execute_highp(pixmap, filter_scratch);
+            }
+            PreparedFilter::DropShadow(drop_shadow) => {
+                drop_shadow.execute_highp(pixmap, filter_scratch);
+            }
+            PreparedFilter::ColorMatrix(color_matrix) => {
+                color_matrix.execute_highp(pixmap, filter_scratch);
+            }
         }
     }
 }

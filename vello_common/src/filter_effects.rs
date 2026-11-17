@@ -15,29 +15,28 @@
 //!
 //! **Filter Functions:**
 //! - `Blur` - Gaussian blur effect
+//! - `Brightness`, `Contrast`, `Grayscale`, `HueRotate`, `Invert`,
+//!   `Opacity`, `Saturate`, `Sepia` - Lowered to a `ColorMatrix` primitive
 //!
-//! **Filter Primitives (Single Use Only):**
+//! **Filter Primitives:**
 //! - `Flood` - Solid color fill
 //! - `GaussianBlur` - Gaussian blur filter
+//! - `ColorMatrix` - Matrix-based color transformation
 //! - `DropShadow` - Drop shadow effect (compound primitive)
 //! - `DropShadowOnly` - Drop shadow effect without the original input
 //! - `Offset` - Translation/shift (single primitive)
 //!
-//! **Note:** Currently only single primitive filters are supported. Filter graphs with
-//! multiple connected primitives are not yet implemented.
+//! **Note:** `vello_cpu` executes filter graphs with multiple primitives by
+//! applying them in insertion order, each taking the previous output as its
+//! input. `vello_gpu` only supports single-primitive filters and does not
+//! support `ColorMatrix` yet.
 //!
 //! ### 🚧 Not Yet Implemented
 //!
 //! **Core Features:**
-//! - `FilterGraph` execution - Chaining multiple filter primitives together
 //! - `FilterInputs` - Connecting primitives to create complex effects
 //!
-//! **Filter Functions:**
-//! - `Brightness`, `Contrast`, `Grayscale`, `HueRotate`, `Invert`,
-//!   `Opacity`, `Saturate`, `Sepia`
-//!
 //! **Filter Primitives:**
-//! - `ColorMatrix` - Matrix-based color transformation
 //! - `Composite` - Porter-Duff compositing operations
 //! - `Blend` - Blend mode operations
 //! - `Morphology` - Dilate/erode operations
@@ -53,6 +52,8 @@ use crate::color::{AlphaColor, Srgb};
 use crate::kurbo::{Affine, Rect, Vec2};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use peniko::kurbo::common::FloatFuncs as _;
 use smallvec::SmallVec;
 
 /// The main filter system.
@@ -74,13 +75,43 @@ impl Filter {
     ///
     /// Converts a high-level CSS-style filter function into a filter graph.
     /// Use this for simple effects like blur, brightness, etc.
+    ///
+    /// Color filter functions are lowered to a [`FilterPrimitive::ColorMatrix`]
+    /// with the matrix defined by the W3C Filter Effects specification.
+    /// Out-of-range parameters are clamped the same way CSS clamps them:
+    /// `grayscale`, `sepia`, `invert` and `opacity` amounts are clamped to
+    /// \[0, 1\], while `brightness`, `contrast` and `saturate` amounts are
+    /// clamped to be non-negative. A NaN parameter makes the function a no-op.
     pub fn from_function(function: FilterFunction) -> Self {
         // Convert function to primitive
         let primitive = match function {
             FilterFunction::Blur { radius } => {
                 FilterPrimitive::gaussian_blur(radius, EdgeMode::default())
             }
-            _ => unimplemented!("Filter function {:?} not supported", function),
+            FilterFunction::Brightness { amount } => FilterPrimitive::ColorMatrix {
+                matrix: brightness_matrix(amount),
+            },
+            FilterFunction::Contrast { amount } => FilterPrimitive::ColorMatrix {
+                matrix: contrast_matrix(amount),
+            },
+            FilterFunction::Grayscale { amount } => FilterPrimitive::ColorMatrix {
+                matrix: grayscale_matrix(amount),
+            },
+            FilterFunction::HueRotate { angle } => FilterPrimitive::ColorMatrix {
+                matrix: hue_rotate_matrix(angle),
+            },
+            FilterFunction::Invert { amount } => FilterPrimitive::ColorMatrix {
+                matrix: invert_matrix(amount),
+            },
+            FilterFunction::Opacity { amount } => FilterPrimitive::ColorMatrix {
+                matrix: opacity_matrix(amount),
+            },
+            FilterFunction::Saturate { amount } => FilterPrimitive::ColorMatrix {
+                matrix: saturate_matrix(amount),
+            },
+            FilterFunction::Sepia { amount } => FilterPrimitive::ColorMatrix {
+                matrix: sepia_matrix(amount),
+            },
         };
 
         Self::from_primitive(primitive)
@@ -252,17 +283,12 @@ pub enum FilterFunction {
         /// approximately 3 times this value in each direction.
         radius: f32,
     },
-    //
-    // ============================================================
-    // TODO: The following filter functions are not yet implemented
-    // ============================================================
-    //
     /// Brightness adjustment.
     ///
     /// Adjusts the brightness of the input image using a linear multiplier.
     Brightness {
         /// Brightness amount: 0.0 = completely black, 1.0 = no change, >1.0 = brighter.
-        /// Must be non-negative.
+        /// Negative values are clamped to 0.0.
         amount: f32,
     },
     /// Contrast adjustment.
@@ -270,7 +296,7 @@ pub enum FilterFunction {
     /// Adjusts the contrast of the input image.
     Contrast {
         /// Contrast amount: 0.0 = uniform gray, 1.0 = no change, >1.0 = higher contrast.
-        /// Must be non-negative.
+        /// Negative values are clamped to 0.0.
         amount: f32,
     },
     /// Grayscale conversion.
@@ -278,7 +304,7 @@ pub enum FilterFunction {
     /// Converts the input to grayscale. Amount controls the strength of the conversion.
     Grayscale {
         /// Grayscale amount: 0.0 = original colors, 1.0 = full grayscale.
-        /// Values should be in range [0.0, 1.0].
+        /// Values outside [0.0, 1.0] are clamped.
         amount: f32,
     },
     /// Hue rotation.
@@ -294,7 +320,7 @@ pub enum FilterFunction {
     /// Inverts the colors of the input image.
     Invert {
         /// Inversion amount: 0.0 = original colors, 1.0 = fully inverted.
-        /// Values should be in range [0.0, 1.0].
+        /// Values outside [0.0, 1.0] are clamped.
         amount: f32,
     },
     /// Opacity adjustment.
@@ -302,7 +328,7 @@ pub enum FilterFunction {
     /// Multiplies the alpha channel by the specified amount.
     Opacity {
         /// Opacity amount: 0.0 = fully transparent, 1.0 = no change.
-        /// Values should be in range [0.0, 1.0].
+        /// Values outside [0.0, 1.0] are clamped.
         amount: f32,
     },
     /// Saturation adjustment.
@@ -311,7 +337,7 @@ pub enum FilterFunction {
     Saturate {
         /// Saturation amount: 0.0 = completely desaturated (grayscale),
         /// 1.0 = no change, >1.0 = oversaturated.
-        /// Must be non-negative.
+        /// Negative values are clamped to 0.0.
         amount: f32,
     },
     /// Sepia tone effect.
@@ -319,7 +345,7 @@ pub enum FilterFunction {
     /// Applies a sepia tone effect (vintage/old photo appearance).
     Sepia {
         /// Sepia amount: 0.0 = original colors, 1.0 = full sepia tone.
-        /// Values should be in range [0.0, 1.0].
+        /// Values outside [0.0, 1.0] are clamped.
         amount: f32,
     },
 }
@@ -427,11 +453,6 @@ pub enum FilterPrimitive {
         /// Edge mode for handling boundaries during blur operation.
         edge_mode: EdgeMode,
     },
-    //
-    // ============================================================
-    // TODO: The following filter primitives are not yet implemented
-    // ============================================================
-    //
     /// Matrix-based color transformation.
     ///
     /// Applies a 4x5 matrix transformation to colors, allowing arbitrary
@@ -451,7 +472,11 @@ pub enum FilterPrimitive {
         /// Vertical offset in pixels. Positive values shift down.
         dy: f32,
     },
-
+    //
+    // ============================================================
+    // TODO: The following filter primitives are not yet implemented
+    // ============================================================
+    //
     /// Composite two inputs using Porter-Duff compositing operations.
     ///
     /// Combines two input images using standard compositing operators
@@ -676,6 +701,183 @@ fn compose_expansions(first: Rect, second: Rect) -> Rect {
 fn blur_radius(std_deviation: f32) -> f64 {
     // Gaussian blur expands uniformly by 3*sigma (covers 99.7% of distribution)
     f64::from(std_deviation * 3.0)
+}
+
+/// Clamp a filter function amount to \[`min`, `max`\], mapping NaN to `fallback`.
+///
+/// The fallback is the no-op value of the respective function, so a NaN
+/// parameter turns the filter into a pass-through instead of propagating NaN
+/// into the color matrix (which would erase the whole layer).
+fn clamp_amount(amount: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if amount.is_nan() {
+        fallback
+    } else {
+        amount.clamp(min, max)
+    }
+}
+
+/// The matrix for `grayscale(amount)`, interpolating between identity and the
+/// luminance-to-gray matrix. See <https://www.w3.org/TR/filter-effects-1/#grayscaleEquivalent>.
+fn grayscale_matrix(amount: f32) -> [f32; 20] {
+    let t = 1.0 - clamp_amount(amount, 0.0, 1.0, 0.0);
+    [
+        0.2126 + 0.7874 * t,
+        0.7152 - 0.7152 * t,
+        0.0722 - 0.0722 * t,
+        0.0,
+        0.0,
+        0.2126 - 0.2126 * t,
+        0.7152 + 0.2848 * t,
+        0.0722 - 0.0722 * t,
+        0.0,
+        0.0,
+        0.2126 - 0.2126 * t,
+        0.7152 - 0.7152 * t,
+        0.0722 + 0.9278 * t,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+}
+
+/// The matrix for `sepia(amount)`, interpolating between identity and the
+/// sepia tone matrix. See <https://www.w3.org/TR/filter-effects-1/#sepiaEquivalent>.
+fn sepia_matrix(amount: f32) -> [f32; 20] {
+    let t = 1.0 - clamp_amount(amount, 0.0, 1.0, 0.0);
+    [
+        0.393 + 0.607 * t,
+        0.769 - 0.769 * t,
+        0.189 - 0.189 * t,
+        0.0,
+        0.0,
+        0.349 - 0.349 * t,
+        0.686 + 0.314 * t,
+        0.168 - 0.168 * t,
+        0.0,
+        0.0,
+        0.272 - 0.272 * t,
+        0.534 - 0.534 * t,
+        0.131 + 0.869 * t,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+}
+
+/// The matrix for `saturate(amount)`. See <https://www.w3.org/TR/filter-effects-1/#saturateEquivalent>.
+fn saturate_matrix(amount: f32) -> [f32; 20] {
+    let s = clamp_amount(amount, 0.0, f32::INFINITY, 1.0);
+    [
+        0.213 + 0.787 * s,
+        0.715 - 0.715 * s,
+        0.072 - 0.072 * s,
+        0.0,
+        0.0,
+        0.213 - 0.213 * s,
+        0.715 + 0.285 * s,
+        0.072 - 0.072 * s,
+        0.0,
+        0.0,
+        0.213 - 0.213 * s,
+        0.715 - 0.715 * s,
+        0.072 + 0.928 * s,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+}
+
+/// The matrix for `hue-rotate(angle)`, with `angle` in degrees.
+/// See <https://www.w3.org/TR/filter-effects-1/#hueRotateEquivalent>.
+fn hue_rotate_matrix(angle: f32) -> [f32; 20] {
+    // Normalize to [0, 360) to keep the trigonometry precise for large angles;
+    // a non-finite angle makes the filter a no-op.
+    let angle = if angle.is_finite() {
+        angle.rem_euclid(360.0)
+    } else {
+        0.0
+    };
+    let (sin, cos) = (angle * (core::f32::consts::PI / 180.0)).sin_cos();
+    [
+        0.213 + cos * 0.787 - sin * 0.213,
+        0.715 - cos * 0.715 - sin * 0.715,
+        0.072 - cos * 0.072 + sin * 0.928,
+        0.0,
+        0.0,
+        0.213 - cos * 0.213 + sin * 0.143,
+        0.715 + cos * 0.285 + sin * 0.140,
+        0.072 - cos * 0.072 - sin * 0.283,
+        0.0,
+        0.0,
+        0.213 - cos * 0.213 - sin * 0.787,
+        0.715 - cos * 0.715 + sin * 0.715,
+        0.072 + cos * 0.928 + sin * 0.072,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+}
+
+/// The matrix for `invert(amount)`. See <https://www.w3.org/TR/filter-effects-1/#invertEquivalent>.
+fn invert_matrix(amount: f32) -> [f32; 20] {
+    let a = clamp_amount(amount, 0.0, 1.0, 0.0);
+    let slope = 1.0 - 2.0 * a;
+    [
+        slope, 0.0, 0.0, 0.0, a, //
+        0.0, slope, 0.0, 0.0, a, //
+        0.0, 0.0, slope, 0.0, a, //
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]
+}
+
+/// The matrix for `opacity(amount)`. See <https://www.w3.org/TR/filter-effects-1/#opacityEquivalent>.
+fn opacity_matrix(amount: f32) -> [f32; 20] {
+    let a = clamp_amount(amount, 0.0, 1.0, 1.0);
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, a, 0.0,
+    ]
+}
+
+/// The matrix for `brightness(amount)`. See <https://www.w3.org/TR/filter-effects-1/#brightnessEquivalent>.
+fn brightness_matrix(amount: f32) -> [f32; 20] {
+    let a = clamp_amount(amount, 0.0, f32::INFINITY, 1.0);
+    [
+        a, 0.0, 0.0, 0.0, 0.0, //
+        0.0, a, 0.0, 0.0, 0.0, //
+        0.0, 0.0, a, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]
+}
+
+/// The matrix for `contrast(amount)`. See <https://www.w3.org/TR/filter-effects-1/#contrastEquivalent>.
+fn contrast_matrix(amount: f32) -> [f32; 20] {
+    let a = clamp_amount(amount, 0.0, f32::INFINITY, 1.0);
+    let intercept = 0.5 - 0.5 * a;
+    [
+        a, 0.0, 0.0, 0.0, intercept, //
+        0.0, a, 0.0, 0.0, intercept, //
+        0.0, 0.0, a, 0.0, intercept, //
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]
 }
 
 #[cfg(test)]
