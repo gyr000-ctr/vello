@@ -24,17 +24,22 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Barrier, Mutex};
 use thread_local::ThreadLocal;
-use vello_common::clip::{ClipContext, ClipShape};
+use vello_common::TargetInit;
+use vello_common::clip::ClipShape;
+use vello_common::color::AlphaColor;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd, dispatch};
 use vello_common::filter::FilterData;
 use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint, PremulColor};
-use vello_common::pixmap::PixmapMut;
-use vello_common::record::{CommandRecorder, LayerClip, LayerProps, PoppedLayer};
+use vello_common::pixmap::{Pixmap, PixmapMut};
+use vello_common::record::{
+    CommandRecorder, LayerClip, LayerProps, PoppedLayer, RecordedLayerKind,
+};
 use vello_common::strip::Strip;
-use vello_common::strip_generator::{GenerationMode, StripGenerator, StripStorage};
+use vello_common::strip_generator::{GenerationMode, StripStorage};
+use vello_common::viewport::ViewportState;
 
 mod cost;
 mod worker;
@@ -55,7 +60,9 @@ type RecordedCommandReceiver = ordered_channel::Receiver<RecordedCommandTask>;
 /// a bit better.
 pub(crate) struct MultiThreadedDispatcher {
     bucketer: Mutex<CommandBucketer>,
-    clip_context: ClipContext,
+    /// Viewport state, tracking the active clip stack and root viewports of
+    /// currently open filter layers.
+    viewport: ViewportState,
     recorder: CommandRecorder<RecordedFill>,
     strip_storage: StripStorage,
     /// The thread pool that is used for dispatching tasks.
@@ -102,13 +109,13 @@ pub(crate) struct MultiThreadedDispatcher {
     task_idx: u32,
     /// The number of threads active in the thread pool.
     num_threads: u16,
-    /// The strip generator for the main thread, used for clip path rasterization.
-    strip_generator: StripGenerator,
     level: Level,
     flushed: bool,
     // So that we can reuse memory allocations across different runs.
     allocations: Allocations,
-    layer_depth: usize,
+    /// For each currently open layer, whether it is a filter layer (and thus
+    /// pushed a root viewport that needs to be popped synchronously).
+    layer_stack: Vec<bool>,
 }
 
 impl MultiThreadedDispatcher {
@@ -146,16 +153,15 @@ impl MultiThreadedDispatcher {
             task_idx,
             flushed,
             workers,
-            clip_context: ClipContext::new(),
+            viewport: ViewportState::new(width, height, level),
             recorder: CommandRecorder::new(width, height),
             task_sender: None,
             recorded_command_receiver: None,
-            strip_generator: StripGenerator::new(width, height, level),
             strip_storage: StripStorage::new(GenerationMode::Append),
             level,
             alpha_storage,
             num_threads,
-            layer_depth: 0,
+            layer_stack: Vec::new(),
         }
     }
 
@@ -264,7 +270,7 @@ impl MultiThreadedDispatcher {
         let allocation_group =
             std::mem::replace(&mut self.allocation_group, self.allocations.get());
         let task_sender = self.task_sender.as_mut().unwrap();
-        let clip_path = self.clip_context.get().map(|c| OwnedClip {
+        let clip_path = self.viewport.clip().map(|c| OwnedClip {
             strips: c.path.strips.into(),
             alphas: c.path.alphas.into(),
             bbox: c.path.bbox,
@@ -273,6 +279,7 @@ impl MultiThreadedDispatcher {
         let task = RenderTask {
             idx: task_idx,
             clip_path,
+            viewport_size: (self.viewport.width(), self.viewport.height()),
             allocation_group,
         };
         task_sender.send(task).unwrap();
@@ -343,6 +350,7 @@ impl MultiThreadedDispatcher {
                                 blend_mode,
                                 mask,
                                 opacity,
+                                filter_data,
                             } => {
                                 let clip_path = clip_path.map(|strip_range| {
                                     let strip_range = self.append_strips(
@@ -363,14 +371,14 @@ impl MultiThreadedDispatcher {
                                         mask,
                                         clip_path,
                                     },
-                                    None,
+                                    filter_data,
                                 );
                             }
+                            // The root viewport of filter layers is pushed/popped
+                            // synchronously in `push_layer`/`pop_layer`, so there is
+                            // nothing left to do here.
                             RecordedCommand::PopLayer => match self.recorder.pop_layer() {
-                                PoppedLayer::Regular => {}
-                                PoppedLayer::Filter => {
-                                    unreachable!("filters are not supported by MT")
-                                }
+                                PoppedLayer::Regular | PoppedLayer::Filter => {}
                             },
                         }
                     }
@@ -396,9 +404,19 @@ impl MultiThreadedDispatcher {
         image_resolver: &dyn ImageResolver,
     ) {
         let mut bucketer = self.bucketer.lock().unwrap();
-        let filters = FilterContext::new(0);
-        bucketer.reset(RectU16::new(0, 0, scene_width, scene_height));
+        let alpha_slots = self.alpha_storage.take();
+        let alpha_buffers = alpha_slots.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+        let filters = self.rasterize_filter_layers::<S, F>(
+            simd,
+            &mut bucketer,
+            &alpha_buffers,
+            encoded_paints,
+            image_resolver,
+        );
+
         let target_init = settings.target_init.map(PremulColor::from_alpha_color);
+        bucketer.reset(RectU16::new(0, 0, scene_width, scene_height));
         bucketer.bucket_commands(
             &self.recorder.nodes,
             &self.recorder.draws,
@@ -408,9 +426,7 @@ impl MultiThreadedDispatcher {
             &filters,
         );
 
-        let alpha_slots = self.alpha_storage.take();
         {
-            let alpha_buffers = alpha_slots.iter().map(Vec::as_slice).collect::<Vec<_>>();
             let resources = FineResources {
                 alpha_buffers: &alpha_buffers,
                 encoded_paints,
@@ -428,39 +444,144 @@ impl MultiThreadedDispatcher {
                 params.target_offset,
                 bucketer.rows().len(),
             );
-            let fines = ThreadLocal::new();
-            self.thread_pool.install(|| {
-                regions.update_par(|region| {
-                    let mut fine = fines
-                        .get_or(|| {
-                            RefCell::new((
-                                Fine::<S, F>::new(simd, bucketer.width()),
-                                DepthBuffer::new(bucketer.width()),
-                            ))
-                        })
-                        .borrow_mut();
-                    let (fine, depth) = &mut *fine;
-
-                    rasterize_region::<S, F>(
-                        fine,
-                        depth,
-                        region,
-                        &bucketer,
-                        resources,
-                        target_init,
-                        self.recorder.root_is_blend_target,
-                    );
-                });
-            });
+            self.rasterize_target::<S, F>(
+                simd,
+                &bucketer,
+                resources,
+                &mut regions,
+                target_init,
+                self.recorder.root_is_blend_target,
+            );
         }
 
         self.alpha_storage.init(alpha_slots);
+    }
+
+    /// Render each filter layer into its own pixmap and apply the filter, mirroring
+    /// the single-threaded dispatcher.
+    ///
+    /// Filter layers are recorded upon "push", so nested filter layers get added after
+    /// their parents and subsequent siblings after the layer they are composited into.
+    /// Therefore, iterating in reverse order is enough to ensure that all dependencies
+    /// have been rendered before they are invoked.
+    fn rasterize_filter_layers<S: Simd, F: FineKernel<S>>(
+        &self,
+        simd: S,
+        bucketer: &mut CommandBucketer,
+        alpha_buffers: &[&[u8]],
+        encoded_paints: &[EncodedPaint],
+        image_resolver: &dyn ImageResolver,
+    ) -> FilterContext {
+        // TODO: Reuse across frames so that pixmaps can be reused.
+        let mut filter_ctx = FilterContext::new(self.recorder.layers.len());
+        for id in self.recorder.filter_layers.iter().rev().copied() {
+            let RecordedLayerKind::Filter {
+                filter_data: filter_plan,
+                placement,
+            } = &self.recorder.layers[id as usize].kind
+            else {
+                unreachable!("filter_layers only contains filter layers");
+            };
+            let pixmap_bbox = placement.pixmap_bbox();
+            if pixmap_bbox.is_empty() {
+                continue;
+            }
+
+            let width = pixmap_bbox.width();
+            let height = pixmap_bbox.height();
+            // TODO: See https://github.com/linebender/vello/pull/1701#discussion_r3400709986, explore
+            // using pools for more resources.
+            let mut pixmap = Pixmap::new(width, height);
+            bucketer.reset(pixmap_bbox);
+            bucketer.bucket_commands(
+                &self.recorder.layers[id as usize].nodes,
+                &self.recorder.draws,
+                &self.recorder.layers,
+                &self.strip_storage.strips,
+                encoded_paints,
+                &filter_ctx,
+            );
+
+            {
+                let resources = FineResources {
+                    alpha_buffers,
+                    encoded_paints,
+                    filter_paints: &bucketer.filter_paints,
+                    image_resolver,
+                };
+                let params = FineRenderParams {
+                    scene_size: (width, height),
+                    target_offset: (0, 0),
+                };
+                let mut target: PixmapMut<'_> = (&mut pixmap).into();
+                let mut regions = Regions::new(
+                    &mut target,
+                    params.scene_size,
+                    params.target_offset,
+                    bucketer.rows().len(),
+                );
+                self.rasterize_target::<S, F>(
+                    simd,
+                    bucketer,
+                    resources,
+                    &mut regions,
+                    TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
+                    false,
+                );
+            }
+
+            F::filter_layer(
+                &mut pixmap,
+                &filter_plan.filter,
+                filter_ctx.scratch(),
+                filter_plan.transform,
+            );
+
+            filter_ctx.set_layer(id as usize, pixmap);
+        }
+
+        filter_ctx
+    }
+
+    fn rasterize_target<S: Simd, F: FineKernel<S>>(
+        &self,
+        simd: S,
+        bucketer: &CommandBucketer,
+        resources: FineResources<'_>,
+        regions: &mut Regions<'_>,
+        target_init: TargetInit<PremulColor>,
+        root_is_blend_target: bool,
+    ) {
+        let fines = ThreadLocal::new();
+        self.thread_pool.install(|| {
+            regions.update_par(|region| {
+                let mut fine = fines
+                    .get_or(|| {
+                        RefCell::new((
+                            Fine::<S, F>::new(simd, bucketer.width()),
+                            DepthBuffer::new(bucketer.width()),
+                        ))
+                    })
+                    .borrow_mut();
+                let (fine, depth) = &mut *fine;
+
+                rasterize_region::<S, F>(
+                    fine,
+                    depth,
+                    region,
+                    bucketer,
+                    resources,
+                    target_init,
+                    root_is_blend_target,
+                );
+            });
+        });
     }
 }
 
 impl Dispatcher for MultiThreadedDispatcher {
     fn has_layers(&self) -> bool {
-        self.layer_depth != 0
+        !self.layer_stack.is_empty()
     }
 
     fn fill_path(
@@ -537,11 +658,13 @@ impl Dispatcher for MultiThreadedDispatcher {
         mask: Option<Mask>,
         filter_data: Option<FilterData>,
     ) {
-        // TODO: Implement filter support in multi-threaded dispatcher.
-        // The single-threaded dispatcher has full filter support, but multi-threaded needs
-        // additional infrastructure for cross-thread layer coordination.
-        if filter_data.is_some() {
-            unimplemented!("Filter effects are not yet supported in multi-threaded rendering");
+        let is_filter = filter_data.is_some();
+        if let Some(filter_data) = &filter_data {
+            // Flush first so that all pending tasks are rendered with the parent
+            // viewport, then expand the viewport so that contents needed for the
+            // filter are not culled away.
+            self.flush_tasks();
+            self.viewport.push_root_viewport(filter_data);
         }
 
         let clip_path = clip_path.map(|c| {
@@ -559,32 +682,36 @@ impl Dispatcher for MultiThreadedDispatcher {
             mask,
             fill_rule,
             aliasing_threshold,
+            filter_data,
         });
-        self.layer_depth += 1;
+        self.layer_stack.push(is_filter);
     }
 
     fn pop_layer(&mut self) {
         self.register_task(RenderTaskType::PopLayer);
-        self.layer_depth = self
-            .layer_depth
-            .checked_sub(1)
-            .expect("layer stack underflow");
+        let is_filter = self.layer_stack.pop().expect("layer stack underflow");
+        if is_filter {
+            // Flush first so that all tasks recorded inside the filter layer are
+            // dispatched with the filter layer's viewport before restoring the
+            // parent viewport.
+            self.flush_tasks();
+            self.viewport.pop_root_viewport();
+        }
     }
 
     fn reset(&mut self, width: u16, height: u16) {
         self.flush();
 
         // Bucketer will be reset lazily during rasterization with the active viewport.
-        self.clip_context.reset();
+        self.viewport.reset(width, height);
         self.recorder.reset(width, height);
         self.strip_storage.clear();
         self.allocation_group.clear();
         self.batch_cost = 0.0;
         self.task_idx = 0;
-        self.layer_depth = 0;
+        self.layer_stack.clear();
         self.task_sender = None;
         self.recorded_command_receiver = None;
-        self.strip_generator.reset(width, height);
         self.alpha_storage.with_inner(|alphas| {
             for alpha in alphas {
                 alpha.clear();
@@ -691,24 +818,18 @@ impl Dispatcher for MultiThreadedDispatcher {
         aliasing_threshold: Option<u8>,
     ) {
         self.flush_tasks();
-        self.clip_context.push_clip_path(
-            path.iter(),
-            &mut self.strip_generator,
-            fill_rule,
-            transform,
-            aliasing_threshold,
-        );
+        self.viewport
+            .push_clip_path(path, fill_rule, transform, aliasing_threshold);
     }
 
     fn push_clip_rect(&mut self, rect: &Rect) {
         self.flush_tasks();
-        self.clip_context
-            .push_clip_rect(rect, &mut self.strip_generator);
+        self.viewport.push_clip_rect(rect);
     }
 
     fn pop_clip(&mut self) {
         self.flush_tasks();
-        self.clip_context.pop_clip();
+        self.viewport.pop_clip();
     }
 
     fn is_multi_threaded(&self) -> bool {
@@ -830,6 +951,11 @@ impl AllocationGroup {
 pub(crate) struct RenderTask {
     pub(crate) idx: u32,
     pub(crate) clip_path: Option<OwnedClip>,
+    /// The size of the viewport that was active when the task was registered.
+    ///
+    /// While a filter layer is open, this is larger than the scene size so that
+    /// contents needed for the filter are not culled away during strip generation.
+    pub(crate) viewport_size: (u16, u16),
     pub(crate) allocation_group: AllocationGroup,
 }
 
@@ -866,6 +992,7 @@ pub(crate) enum RenderTaskType {
         mask: Option<Mask>,
         fill_rule: Fill,
         aliasing_threshold: Option<u8>,
+        filter_data: Option<FilterData>,
     },
     PopLayer,
 }
@@ -890,6 +1017,7 @@ pub(crate) enum RecordedCommand {
         blend_mode: BlendMode,
         mask: Option<Mask>,
         opacity: f32,
+        filter_data: Option<FilterData>,
     },
     PopLayer,
 }

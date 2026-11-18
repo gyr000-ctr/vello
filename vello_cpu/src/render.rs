@@ -535,10 +535,6 @@ impl RenderContext {
     /// Note that the mask, if provided, needs to have the same size as the render context. Otherwise,
     /// it will be ignored. In addition to that, the mask will not be affected by the current
     /// transformation matrix in place.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `filter` is provided when this context uses multi-threaded rendering.
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -610,13 +606,7 @@ impl RenderContext {
 
     /// Push a filter layer that affects all subsequent drawing operations.
     ///
-    /// WARNING: Note that filters are currently incomplete and experimental. In
-    /// particular, they will lead to a panic when used in combination with
-    /// multi-threaded rendering.
-    ///
-    /// # Panics
-    ///
-    /// Panics when this context uses multi-threaded rendering.
+    /// WARNING: Note that filters are currently incomplete and experimental.
     pub fn push_filter_layer(&mut self, filter: Filter) {
         self.push_layer(None, None, None, None, Some(filter));
     }
@@ -1447,6 +1437,237 @@ mod tests {
             }
 
             drop(ctx);
+        }
+    }
+
+    /// Tests for filter layers in the multi-threaded dispatcher.
+    ///
+    /// The main correctness oracle is the single-threaded dispatcher: for every
+    /// scene, the multi-threaded output must match it pixel-by-pixel.
+    #[cfg(feature = "multithreading")]
+    mod mt_filter {
+        use crate::{RenderContext, RenderSettings, Resources};
+        use vello_common::color::palette::css::{BLUE, GREEN, PURPLE, RED, YELLOW};
+        use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
+        use vello_common::kurbo::{Circle, Rect, Shape};
+        use vello_common::pixmap::Pixmap;
+
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 100;
+
+        fn blur(std_deviation: f32) -> Filter {
+            Filter::from_primitive(FilterPrimitive::GaussianBlur {
+                std_deviation_x: std_deviation,
+                std_deviation_y: std_deviation,
+                edge_mode: EdgeMode::None,
+            })
+        }
+
+        fn render(num_threads: u16, draw: impl Fn(&mut RenderContext)) -> Pixmap {
+            let mut ctx = RenderContext::new_with(
+                WIDTH,
+                HEIGHT,
+                RenderSettings {
+                    num_threads,
+                    ..Default::default()
+                },
+            );
+            draw(&mut ctx);
+            ctx.flush();
+
+            let mut pixmap = Pixmap::new(WIDTH, HEIGHT);
+            let mut resources = Resources::new();
+            ctx.render(&mut pixmap, &mut resources);
+            pixmap
+        }
+
+        fn assert_matches_single_threaded(draw: impl Fn(&mut RenderContext)) {
+            let reference = render(0, &draw);
+
+            // A thread count of 1 still exercises the multi-threaded dispatcher,
+            // including its task batching and result merging.
+            for num_threads in [1, 4] {
+                let pixmap = render(num_threads, &draw);
+                assert_eq!(
+                    reference.data_as_u8_slice(),
+                    pixmap.data_as_u8_slice(),
+                    "multi-threaded output with {num_threads} threads differs \
+                     from single-threaded output"
+                );
+            }
+        }
+
+        #[test]
+        fn blur_layer_matches_single_threaded() {
+            assert_matches_single_threaded(|ctx| {
+                ctx.set_paint(BLUE);
+                ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+                ctx.push_filter_layer(blur(3.0));
+                ctx.set_paint(RED);
+                ctx.fill_rect(&Rect::new(20.0, 20.0, 60.0, 60.0));
+                ctx.set_paint(YELLOW);
+                ctx.fill_path(&Circle::new((70.0, 70.0), 20.0).to_path(0.1));
+                ctx.pop_layer();
+            });
+        }
+
+        /// Draw enough shapes inside the filter layer to trigger multiple batch
+        /// flushes while the layer is open.
+        #[test]
+        fn blur_layer_spanning_multiple_batches_matches_single_threaded() {
+            assert_matches_single_threaded(|ctx| {
+                ctx.push_filter_layer(blur(2.0));
+                for i in 0..200 {
+                    let x = f64::from(i % 10) * 10.0;
+                    let y = f64::from(i / 10) * 5.0;
+                    ctx.set_paint(RED);
+                    ctx.fill_rect(&Rect::new(x, y, x + 6.0, y + 3.0));
+                }
+                ctx.pop_layer();
+            });
+        }
+
+        /// A filter layer whose pixmap is much larger than the scene itself.
+        /// Contents partially outside the viewport must still be rendered, since
+        /// the blur makes them visible inside it.
+        #[test]
+        fn huge_layer_matches_single_threaded() {
+            assert_matches_single_threaded(|ctx| {
+                ctx.push_filter_layer(blur(80.0));
+                ctx.set_paint(GREEN);
+                ctx.fill_rect(&Rect::new(-50.0, -50.0, 150.0, 150.0));
+                ctx.pop_layer();
+            });
+        }
+
+        #[test]
+        fn drop_shadow_matches_single_threaded() {
+            assert_matches_single_threaded(|ctx| {
+                let shadow = Filter::from_primitive(FilterPrimitive::DropShadow {
+                    dx: 8.0,
+                    dy: 8.0,
+                    std_deviation: 4.0,
+                    color: PURPLE,
+                    edge_mode: EdgeMode::None,
+                });
+                ctx.push_filter_layer(shadow);
+                ctx.set_paint(RED);
+                ctx.fill_rect(&Rect::new(10.0, 10.0, 70.0, 70.0));
+                ctx.pop_layer();
+            });
+        }
+
+        /// Nested filter layers combined with a clip path that is pushed before
+        /// the filters, which forces the clip state to be rebuilt for each
+        /// filter layer viewport.
+        #[test]
+        fn nested_filters_with_clip_match_single_threaded() {
+            assert_matches_single_threaded(|ctx| {
+                let clip = Circle::new((50.0, 50.0), 45.0).to_path(0.1);
+                ctx.push_clip_path(&clip);
+
+                ctx.push_filter_layer(blur(2.0));
+                ctx.set_paint(GREEN);
+                ctx.fill_rect(&Rect::new(10.0, 10.0, 90.0, 90.0));
+
+                let offset = Filter::from_primitive(FilterPrimitive::Offset { dx: 5.0, dy: 5.0 });
+                ctx.push_filter_layer(offset);
+                ctx.set_paint(BLUE);
+                ctx.fill_rect(&Rect::new(30.0, 30.0, 60.0, 60.0));
+                ctx.pop_layer();
+
+                ctx.pop_layer();
+                ctx.pop_clip();
+            });
+        }
+
+        /// Sibling filter layers composited into the same parent, rendered one
+        /// after another.
+        #[test]
+        fn sibling_filter_layers_match_single_threaded() {
+            assert_matches_single_threaded(|ctx| {
+                ctx.push_filter_layer(blur(2.0));
+                ctx.set_paint(RED);
+                ctx.fill_rect(&Rect::new(5.0, 5.0, 45.0, 45.0));
+                ctx.pop_layer();
+
+                ctx.push_filter_layer(blur(5.0));
+                ctx.set_paint(BLUE);
+                ctx.fill_rect(&Rect::new(55.0, 55.0, 95.0, 95.0));
+                ctx.pop_layer();
+            });
+        }
+
+        /// Cancelling a render by resetting with a filter layer still open
+        /// (and without flushing) must not panic, and the context must stay
+        /// usable afterwards.
+        #[test]
+        fn reset_with_open_filter_layer() {
+            let mut ctx = RenderContext::new_with(
+                WIDTH,
+                HEIGHT,
+                RenderSettings {
+                    num_threads: 4,
+                    ..Default::default()
+                },
+            );
+
+            ctx.push_filter_layer(blur(3.0));
+            ctx.set_paint(RED);
+            // Draw enough to trigger a batch send while the layer is open.
+            for _ in 0..300 {
+                ctx.fill_rect(&Rect::new(0.0, 0.0, 50.0, 50.0));
+            }
+
+            ctx.reset();
+            assert!(!ctx.dispatcher.has_layers());
+
+            // The context must still be usable for subsequent frames.
+            ctx.push_filter_layer(blur(3.0));
+            ctx.set_paint(BLUE);
+            ctx.fill_rect(&Rect::new(10.0, 10.0, 90.0, 90.0));
+            ctx.pop_layer();
+            ctx.flush();
+
+            let mut pixmap = Pixmap::new(WIDTH, HEIGHT);
+            let mut resources = Resources::new();
+            ctx.render(&mut pixmap, &mut resources);
+        }
+
+        /// Dropping the context with an unflushed, still-open filter layer
+        /// must not panic.
+        #[test]
+        fn drop_with_open_filter_layer() {
+            for _ in 0..10 {
+                let mut ctx = RenderContext::new_with(
+                    WIDTH,
+                    HEIGHT,
+                    RenderSettings {
+                        num_threads: 4,
+                        ..Default::default()
+                    },
+                );
+
+                ctx.push_filter_layer(blur(3.0));
+                ctx.set_paint(RED);
+                for _ in 0..300 {
+                    ctx.fill_rect(&Rect::new(0.0, 0.0, 50.0, 50.0));
+                }
+
+                drop(ctx);
+            }
+        }
+
+        /// A filter layer with empty contents must not produce any output,
+        /// but must also not crash.
+        #[test]
+        fn empty_filter_layer_matches_single_threaded() {
+            assert_matches_single_threaded(|ctx| {
+                ctx.set_paint(RED);
+                ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+                ctx.push_filter_layer(blur(3.0));
+                ctx.pop_layer();
+            });
         }
     }
 

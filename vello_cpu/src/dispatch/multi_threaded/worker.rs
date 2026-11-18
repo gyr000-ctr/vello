@@ -52,6 +52,14 @@ impl Worker {
         self.strip_storage
             .set_generation_mode(GenerationMode::Append);
         let task_idx = render_task.idx;
+        // Tasks recorded inside a filter layer are rendered with an expanded viewport,
+        // so that contents needed for the filter are not culled away.
+        let (viewport_width, viewport_height) = render_task.viewport_size;
+        if self.strip_generator.width() != viewport_width
+            || self.strip_generator.height() != viewport_height
+        {
+            self.strip_generator.reset(viewport_width, viewport_height);
+        }
         let path_clip = render_task.clip_path.as_ref().map(|c| ClipRef {
             path: PathDataRef {
                 strips: c.strips.as_ref(),
@@ -171,6 +179,7 @@ impl Worker {
                     mask,
                     fill_rule,
                     aliasing_threshold,
+                    filter_data,
                 } => {
                     let (clip, clip_bbox) = if let Some((path_range, transform)) = clip_path {
                         let start = self.strip_storage.strips.len() as u32;
@@ -205,6 +214,7 @@ impl Worker {
                         blend_mode,
                         mask,
                         opacity,
+                        filter_data,
                     };
 
                     render_task
